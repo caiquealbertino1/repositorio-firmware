@@ -1,23 +1,16 @@
 /*
- * =====================================================================
- *  PROJETO MOTIVA - MONITORAMENTO DE VEGETACAO
- *  FIRMWARE 1.0  (versao simplificada, sem bibliotecas externas)
- *  S2-CP02 - Atualizacao Remota de Firmware (OTA)
+ * S2-CP02 - Projeto Motiva | Firmware 1.0
+ * Atualizacao remota de firmware (OTA)
  *
- *  - Gera 5 leituras pseudoaleatorias (10-20 cm) por sessao
- *  - Faz 1 leitura a cada 2 segundos
- *  - Calcula a media aritmetica da sessao
- *  - Inicia uma nova sessao a cada 48 segundos, contados a partir do
- *    inicio da sessao anterior (usa millis(), sem delay longo)
- *  - Apos 3 sessoes, conecta ao Wi-Fi, baixa o version.json, compara
- *    a versao e, se houver uma mais nova, baixa o firmware_v2.bin e
- *    executa a atualizacao OTA, reiniciando na versao 2.0
- *  - LED: indica visualmente que a versao 1.0 esta em execucao (AZUL)
+ * ESP32 DevKit + Wokwi-GUEST
  *
- *  Observacao: esta versao NAO usa a biblioteca ArduinoJson. O
- *  version.json e lido "na mao" com indexOf/substring, porque o
- *  arquivo tem so dois campos simples ("version" e "url").
- * =====================================================================
+ * Fluxo:
+ *   1. Executa 5 leituras pseudoaleatorias entre 10 e 20 cm.
+ *   2. Faz uma leitura a cada 2 segundos.
+ *   3. Fecha a sessao e calcula a media.
+ *   4. Uma nova sessao comeca 48 segundos apos o inicio da anterior.
+ *   5. Depois de 3 sessoes, consulta version.json no GitHub.
+ *   6. Se houver uma versao maior, baixa firmware_v2.bin e executa OTA.
  */
 
 #include <WiFi.h>
@@ -26,155 +19,266 @@
 #include <WiFiClientSecure.h>
 
 // ---------------------------------------------------------------------
-// CONFIGURACOES GERAIS - AJUSTE PARA O SEU REPOSITORIO
+// CONFIGURACAO DO OTA
 // ---------------------------------------------------------------------
-String versao = "1.0";
-String linkJson = "https://raw.githubusercontent.com/SEU_USUARIO/repositorio-firmware/main/version.json";
+const char *VERSAO = "1.0";
+const char *WIFI_SSID = "Wokwi-GUEST";
+const char *WIFI_PASSWORD = "";
+const int WIFI_CHANNEL = 6;
 
-// LED RGB (catodo comum: HIGH = aceso)
-int ledVermelho = 25;
-int ledVerde    = 26;
-int ledAzul     = 27;
+const char *URL_MANIFESTO =
+    "https://raw.githubusercontent.com/caiquealbertino1/repositorio-firmware/main/version.json";
 
 // ---------------------------------------------------------------------
-// VARIAVEIS DE ESTADO
+// LED RGB - catodo comum
 // ---------------------------------------------------------------------
-int leituras[5];
-int contador   = 0;
-int sessoes    = 0;
-unsigned long inicio = 0;
-bool atualizado = false;
+const int LED_VERMELHO = 25;
+const int LED_VERDE = 26;
+const int LED_AZUL = 27;
 
-// =====================================================================
-// FUNCOES DE SESSAO / LEITURA
-// =====================================================================
-void comecarSessao() {
-  inicio = millis();
-  contador = 0;
+// ---------------------------------------------------------------------
+// SESSAO
+// ---------------------------------------------------------------------
+const int TOTAL_LEITURAS = 5;
+const unsigned long INTERVALO_LEITURA = 2000UL;
+const unsigned long INTERVALO_SESSAO = 48000UL;
+
+int leituras[TOTAL_LEITURAS];
+int contadorLeituras = 0;
+int sessoesConcluidas = 0;
+unsigned long inicioSessao = 0;
+bool verificacaoConcluida = false;
+
+// ---------------------------------------------------------------------
+// LED
+// ---------------------------------------------------------------------
+void mostrarFirmware1() {
+  digitalWrite(LED_VERMELHO, LOW);
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AZUL, HIGH);
+}
+
+// ---------------------------------------------------------------------
+// SESSAO / LEITURAS
+// ---------------------------------------------------------------------
+void iniciarSessao() {
+  inicioSessao = millis();
+  contadorLeituras = 0;
+
   Serial.println("========================================");
-  Serial.println("MONITORAMENTO DE VEGETACAO - FW " + versao);
+  Serial.println("MONITORAMENTO DE VEGETACAO - FW 1.0");
   Serial.println("========================================");
 }
 
-void lerValor() {
-  leituras[contador] = random(10, 21); // numero de 10 a 20 (inclusive)
-  Serial.println("Leitura " + String(contador + 1) + ": " + String(leituras[contador]) + " cm");
-  contador++;
+void realizarLeitura() {
+  leituras[contadorLeituras] = random(10, 21); // 10..20 inclusive
+
+  Serial.print("Leitura ");
+  Serial.print(contadorLeituras + 1);
+  Serial.print(": ");
+  Serial.print(leituras[contadorLeituras]);
+  Serial.println(" cm");
+
+  contadorLeituras++;
 }
 
-float media() {
+float calcularMedia() {
   int soma = 0;
-  for (int i = 0; i < 5; i++) {
-    soma = soma + leituras[i];
+
+  for (int i = 0; i < TOTAL_LEITURAS; i++) {
+    soma += leituras[i];
   }
-  return soma / 5.0;
+
+  return soma / 5.0f;
 }
 
-// =====================================================================
-// PARSING MANUAL DO version.json (sem biblioteca externa)
-//   Espera um JSON simples do tipo:
-//   { "version": "2.0", "url": "https://.../firmware_v2.bin" }
-// =====================================================================
-String pegarValor(String texto, String nome) {
-  int posicao = texto.indexOf(nome);
-  int comeco  = texto.indexOf("\"", texto.indexOf(":", posicao)) + 1;
-  int fim     = texto.indexOf("\"", comeco);
-  return texto.substring(comeco, fim);
+void finalizarSessao() {
+  Serial.print("Media da sessao: ");
+  Serial.print(calcularMedia(), 1);
+  Serial.println(" cm");
+
+  Serial.println("Proxima sessao em 48 segundos.");
+  Serial.println();
+
+  sessoesConcluidas++;
 }
 
-// =====================================================================
-// VERIFICACAO E EXECUCAO DA ATUALIZACAO OTA
-// =====================================================================
-void procurarAtualizacao() {
-  Serial.println("Procurando atualizacao...");
+// ---------------------------------------------------------------------
+// PARSING SIMPLES DO version.json
+// Espera:
+// {"version":"2.0","url":"https://.../firmware_v2.bin"}
+// ---------------------------------------------------------------------
+bool extrairCampoJson(const String &json, const String &campo, String &valor) {
+  String chave = "\"" + campo + "\"";
+  int posicaoChave = json.indexOf(chave);
 
-  // 1) conectar no Wi-Fi da rede do Wokwi
-  WiFi.begin("Wokwi-GUEST", "", 6);
-  int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+  if (posicaoChave < 0) {
+    return false;
+  }
+
+  int posicaoDoisPontos = json.indexOf(':', posicaoChave + chave.length());
+  if (posicaoDoisPontos < 0) {
+    return false;
+  }
+
+  int inicioValor = json.indexOf('"', posicaoDoisPontos + 1);
+  if (inicioValor < 0) {
+    return false;
+  }
+
+  int fimValor = json.indexOf('"', inicioValor + 1);
+  if (fimValor < 0) {
+    return false;
+  }
+
+  valor = json.substring(inicioValor + 1, fimValor);
+  return valor.length() > 0;
+}
+
+// ---------------------------------------------------------------------
+// WIFI
+// ---------------------------------------------------------------------
+bool conectarWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  Serial.println("Conectando ao Wi-Fi Wokwi-GUEST...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
+
+  const int maxTentativas = 20;
+  for (int tentativa = 1; tentativa <= maxTentativas; tentativa++) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Wi-Fi conectado.");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      return true;
+    }
+
     delay(500);
-    tentativas++;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Erro: sem internet");
-    return; // tenta de novo na proxima vez que entrar aqui
-  }
-  Serial.println("Wi-Fi conectado");
 
-  // 2) baixar o version.json
+  Serial.println("Erro: sem conexao Wi-Fi/internet.");
+  return false;
+}
+
+// ---------------------------------------------------------------------
+// OTA
+// ---------------------------------------------------------------------
+void procurarAtualizacao() {
+  Serial.println("----------------------------------------");
+  Serial.println("Verificando atualizacao OTA...");
+
+  if (!conectarWiFi()) {
+    Serial.println("OTA cancelada: Wi-Fi indisponivel.");
+    return;
+  }
+
   WiFiClientSecure cliente;
-  cliente.setInsecure(); // simulacao: ignora validacao do certificado
+  cliente.setInsecure(); // apropriado para a simulacao da CP2
+
   HTTPClient http;
-  http.begin(cliente, linkJson);
+  if (!http.begin(cliente, URL_MANIFESTO)) {
+    Serial.println("Erro: nao foi possivel iniciar a requisicao do manifesto.");
+    return;
+  }
+
   int codigoHttp = http.GET();
-  if (codigoHttp != 200) {
-    Serial.println("Erro: nao consegui abrir o version.json (HTTP " + String(codigoHttp) + ")");
+
+  if (codigoHttp != HTTP_CODE_OK) {
+    Serial.print("Erro: manifesto inacessivel. HTTP ");
+    Serial.println(codigoHttp);
     http.end();
     return;
   }
-  String texto = http.getString();
+
+  String manifesto = http.getString();
   http.end();
 
-  // 3) comparar as versoes
-  String versaoNova = pegarValor(texto, "version");
-  String linkBin     = pegarValor(texto, "url");
-  Serial.println("Versao atual: " + versao + " | Versao no GitHub: " + versaoNova);
+  Serial.println("Manifesto recebido com sucesso.");
 
-  if (versaoNova.length() == 0 || linkBin.length() == 0) {
-    Serial.println("Erro: nao consegui ler o conteudo do version.json");
+  String versaoDisponivel;
+  String urlFirmware;
+
+  if (!extrairCampoJson(manifesto, "version", versaoDisponivel) ||
+      !extrairCampoJson(manifesto, "url", urlFirmware)) {
+    Serial.println("Erro: manifesto invalido ou incompleto.");
     return;
   }
 
-  if (versaoNova.toFloat() <= versao.toFloat()) {
-    Serial.println("Ja esta na versao mais nova");
-    atualizado = true;
+  Serial.print("Versao instalada: ");
+  Serial.println(VERSAO);
+  Serial.print("Versao disponivel: ");
+  Serial.println(versaoDisponivel);
+  Serial.print("URL do firmware: ");
+  Serial.println(urlFirmware);
+
+  if (versaoDisponivel.toFloat() <= String(VERSAO).toFloat()) {
+    Serial.println("A versao instalada ja e a mais recente.");
+    verificacaoConcluida = true;
     return;
   }
 
-  // 4) baixar o .bin e gravar (OTA)
-  Serial.println("Versao nova encontrada! Baixando...");
-  t_httpUpdate_return resultado = httpUpdate.update(cliente, linkBin);
+  Serial.println("Nova versao encontrada!");
+  Serial.println("Baixando firmware_v2.bin e iniciando OTA...");
 
-  if (resultado != HTTP_UPDATE_OK) {
-    Serial.println("Erro ao baixar ou atualizar: " + httpUpdate.getLastErrorString());
+  t_httpUpdate_return resultado = httpUpdate.update(cliente, urlFirmware);
+
+  switch (resultado) {
+    case HTTP_UPDATE_FAILED:
+      Serial.print("Erro OTA: ");
+      Serial.println(httpUpdate.getLastErrorString());
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("OTA: servidor informou que nao ha atualizacao.");
+      break;
+
+    case HTTP_UPDATE_OK:
+      // Normalmente o ESP32 reinicia automaticamente apos sucesso.
+      Serial.println("OTA concluida. Reiniciando para o Firmware 2.0...");
+      break;
   }
-  // se der certo, o ESP32 reinicia sozinho ja no Firmware 2.0
 }
 
-// =====================================================================
+// ---------------------------------------------------------------------
 // SETUP / LOOP
-// =====================================================================
+// ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  pinMode(ledVermelho, OUTPUT);
-  pinMode(ledVerde, OUTPUT);
-  pinMode(ledAzul, OUTPUT);
-  digitalWrite(ledAzul, HIGH); // azul = versao 1.0
+
+  pinMode(LED_VERMELHO, OUTPUT);
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AZUL, OUTPUT);
+  mostrarFirmware1();
 
   randomSeed(analogRead(0));
 
-  Serial.println("Rodando o FIRMWARE " + versao);
-  comecarSessao();
+  Serial.println();
+  Serial.println("Rodando o FIRMWARE 1.0");
+  iniciarSessao();
 }
 
 void loop() {
-  // uma leitura a cada 2 segundos, contadas a partir do inicio da sessao
-  if (contador < 5 && millis() - inicio >= (unsigned long)contador * 2000) {
-    lerValor();
+  unsigned long agora = millis();
 
-    if (contador == 5) {
-      Serial.println("Media da sessao: " + String(media(), 1) + " cm");
-      Serial.println("Proxima sessao em 48 segundos.");
-      sessoes++;
+  // Leitura 1 em 0 s, leitura 2 em 2 s ... leitura 5 em 8 s.
+  if (contadorLeituras < TOTAL_LEITURAS &&
+      agora - inicioSessao >= (unsigned long)contadorLeituras * INTERVALO_LEITURA) {
+    realizarLeitura();
 
-      if (sessoes >= 3 && !atualizado) {
+    if (contadorLeituras == TOTAL_LEITURAS) {
+      finalizarSessao();
+
+      // O enunciado exige que a consulta aconteca apos pelo menos 3 ciclos.
+      if (sessoesConcluidas >= 3 && !verificacaoConcluida) {
         procurarAtualizacao();
       }
     }
   }
 
-  // nova sessao exatamente 48 segundos depois do inicio da anterior
-  if (millis() - inicio >= 48000) {
-    comecarSessao();
+  // Nova sessao 48 s apos o INICIO da sessao anterior.
+  if (agora - inicioSessao >= INTERVALO_SESSAO) {
+    iniciarSessao();
   }
 }
