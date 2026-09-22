@@ -1,1 +1,0 @@
-PLACEHOLDER_FIRMWARE_V2_BIN - substitua por um .bin real compilado no Arduino IDE (Sketch > Export Compiled Binary a partir de firmware_v2.ino) antes de publicar no repositorio GitHub.
